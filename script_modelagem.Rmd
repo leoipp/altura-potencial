@@ -1,0 +1,374 @@
+---
+title: "Altura Maxima Potencial de Vegetação Nativa do Estado de Minas Gerais"
+knit: (function(input_file, encoding) {
+  out_dir <- 'docs';
+  rmarkdown::render(input_file,
+ encoding=encoding,
+ output_file=file.path(dirname(input_file), out_dir, 'index.html'))})
+author: "Leonardo Ippoilit Rodrigues"
+date: "25/11/2021"
+output: html_document
+---
+
+## Carregando pacotes utilizados.
+
+```{r Pacotes}
+require(raster)
+require(dplyr)
+require(rgdal)
+require(repmis)
+require(randomForest)
+require(caret)
+```
+
+## Carregando dados utilizados.
+
+Previamente a anÃ¡lise de dados foi feito um grid de pontos regulares com espaÃ§amento de 5.000 x 5.000m sobre as camadas de variÃ¡veis ambientais. Todas as camadas ambientais puderam ser obtidas atraves de plataformas Open Source como o Google Earth Engine e a NASA Search Engine para dados GEDI.
+
+### Download de dados.
+
+Os pontos de amostras podem ser obtidos a partir do link para o google drive abaixo.
+https://drive.google.com/drive/folders/1QanoZOvPIz2DayJjVKYLTdrzBkScVAOY?usp=sharing
+OBS: Os pontos de amostras sÃ£o um arquivo vetor em formato shapefile, portanto para a analise todos documentos contidos dentro do drive devem ser baixados para acompanhar as analises realizadas.
+
+```{r Abertura de Dados}
+Amostras <- shapefile('amostras.shp')
+Amostras <- Amostras@data
+```
+
+## Limpeza e integridade dos pontos selecionados.
+
+Todos os pontos correspondentes a NA valores para a altura relativa (RH100) foram removidos. Assim como foi o filtro de dados para variavel mapbiomas com valores correspondentes a 3 (formaÃ§Ã£o florestal) ou 4 (formaÃ§Ã£o campestre) ou 5 (formaÃ§Ã£o savÃ¢nica).
+
+```{r SeleÃ§Ã£o de pontos de interesse}
+Amostras_filtradas <- subset(Amostras, !is.na(rh100))
+Amostras_filtradas <- subset(Amostras_filtradas, mapbiomas. == 3 | mapbiomas. == 4 |mapbiomas. == 12)
+```
+
+### ConvenÃ§Ã£o de nomeclaturas para variÃ¡veis.
+
+As variaveis seguem as nomeclaturas a seguir.
+mapbiomas: Classes de formaÃ§Ã£o de florestas naturais filtradas nos passos anterior, 3 classes presentes (formaÃ§Ã£o floresta, campestre e savÃ¢nica);
+count: NÃºmero de pulsos emitidos Ã  superficie terrestre pelo sistema LiDar;
+rh100: Altura relativa de copa acima do solo;
+tempMA: Temperatura mÃ©dia anual;
+precMA: PrecipitaÃ§Ã£o mÃ©dia anual;
+NAnuvens: NÃºmero de dias sem cobertura de nuvens;
+Inf100: NÃºmero de meses com precipitaÃ§Ã£o inferior a 100 milÃ­metros;
+mde: Modelo digital de elevaÃ§Ã£o;
+decliv: Declividade
+
+```{r Nomeclatura das variaveis}
+names(Amostras_filtradas) <- c('mapbiomas', 'count', 'rh100', 'tempMA', 'precMA',
+                  'NAnuvens', 'Inf100', 'mde', 'decliv')
+```
+
+### Correlacionando variÃ¡veis.
+
+Para determinarmos quais inputs serao selecionados para treinamento do modelo Random Forest.
+De acordo com a correlÃ§ao, somente o modelo digital de elevaÃ§Ã£o apresenta influencia nula sobre a altura relativa, corr(0.03). Portanto esta serÃ¡ removida dos calculos.
+A varivel de precipitaÃ§Ã£o mÃ©dia anual e numero de meses com precipitaÃ§Ã£o inferior a 100mm apresentaram baixa correlaÃ§Ã£o, poderemos explorar isso mais a frente.
+
+```{r CorrelaÃ§Ã£o de variÃ¡veis}
+corTemp <- cor(Amostras_filtradas$tempMA, Amostras_filtradas$rh100)
+corPrec <- cor(Amostras_filtradas$precMA, Amostras_filtradas$rh100)
+corDec <- cor(Amostras_filtradas$decliv, Amostras_filtradas$rh100)
+corMde <- cor(Amostras_filtradas$mde, Amostras_filtradas$rh100)
+corNanuvens <- cor(Amostras_filtradas$NAnuvens, Amostras_filtradas$rh100)
+corInf100 <- cor(Amostras_filtradas$Inf100, Amostras_filtradas$rh100)
+```
+
+
+## CÃ¡lculos de Fronteira de eficiencia.
+
+```{r}
+Altura_potencial <- data.frame()
+```
+
+### Range de amostras para variavel de temperatura mÃ©dia anual.
+
+SeleÃ§Ã£o de 20 amostras dentro dos valores maximos (25) e minimos(12.5) apresentados pela variavel temperatura mÃ©dia anual.
+
+```{r Range de amostras de temperatura mÃ©dia anual}
+Range_amostras <- range(Amostras_filtradas$tempMA)
+Quantidade_de_amostras <- 20
+Range_amostras <- seq(Range_amostras[1]-0.1, Range_amostras[2], length.out = Quantidade_de_amostras)
+```
+
+### CÃ¡lculo de mÃ¡ximos locais para fronteira de eficiÃªncia da temperatura mÃ©dia anual.
+
+O loop for() farÃ¡ a seleÃ§Ã£o dos maiores valores da variavel temperatura mÃ©dia anual(tempMA) para cada intervalo de valores correspondente da altura relativa(rh100).
+
+```{r Calculo de mÃ¡ximos locais para a temperatura mÃ©dia anual}
+Front_eficiencia <- data.frame()
+for(b in seq(1, Quantidade_de_amostras-1, 1)){
+  tempB <- Amostras_filtradas[Amostras_filtradas$tempMA > Range_amostras[b] & Amostras_filtradas$tempMA <= Range_amostras[b+1],]
+  tempB
+  tempB <- arrange(tempB, rh100)
+  Front_eficiencia <- rbind(Front_eficiencia, tail(tempB, 1))
+}
+
+```
+
+### Plot simples dos dados calculados para a temperatura media anual.
+
+```{r plot temperatura media anual}
+plot(Amostras_filtradas$tempMA, Amostras_filtradas$rh100, pch = 20)
+points(Front_eficiencia$tempMA, Front_eficiencia$rh100, pch = 20, col = 'red')
+```
+
+
+Pelo grafico podemos observar a tendencia de permanencia da media de valores da altura relativa de acordo com a variaÃ§Ã£o de temperatura mÃ©dia anual. Mesmo tendo certa correlaÃ§Ã£o entre variÃ¡veis, a temperatura mÃ©dia anual serÃ¡ descartada para treinamento do modelo da altura mÃ¡xima potencial.
+
+### Range de amostras para variavel de precipitaÃ§Ã£o mÃ©dia anual.
+
+SeleÃ§Ã£o de 20 amostras dentro dos valores maximos (2173) e minimos(706) apresentados pela variavel precipitaÃ§Ã£o mÃ©dia anual.
+
+```{r Range de amostras de precipitaÃ§Ã£o mÃ©dia anual}
+Range_amostras <- range(Amostras_filtradas$precMA)
+Quantidade_de_amostras <- 20
+Range_amostras <- seq(Range_amostras[1]-0.1, Range_amostras[2], length.out = Quantidade_de_amostras)
+```
+
+### CÃ¡lculo de mÃ¡ximos locais para fronteira de eficiÃªncia da precipitaÃ§Ã£o mÃ©dia anual.
+
+O loop for() farÃ¡ a seleÃ§Ã£o dos maiores valores da variavel precipitaÃ§Ã£o mÃ©dia anual(precMA) para cada intervalo de valores correspondente da altura relativa(rh100).
+
+```{r Calculo de mÃ¡ximos locais para a precipitaÃ§Ã£o mÃ©dia anual}
+Front_eficiencia <- data.frame()
+for(b in seq(1, Quantidade_de_amostras-1, 1)){
+  tempB <- Amostras_filtradas[Amostras_filtradas$precMA > Range_amostras[b] & Amostras_filtradas$precMA <= Range_amostras[b+1],]
+  tempB
+  tempB <- arrange(tempB, rh100)
+  Front_eficiencia <- rbind(Front_eficiencia, tail(tempB, 1))
+}
+Altura_potencial <- rbind(Altura_potencial, Front_eficiencia)
+```
+
+### Plot simples dos dados calculados para a precipitaÃ§Ã£o mÃ©dia anual.
+
+```{r Plot precipitaÃ§Ã£o mÃ©dia anual}
+plot(Amostras_filtradas$precMA, Amostras_filtradas$rh100, pch = 20)
+points(Front_eficiencia$precMA, Front_eficiencia$rh100, pch = 20, col = 'red')
+```
+
+### Range de amostras para variavel de numeros de meses com precipitaÃ§Ã£o inferior a 100mm.
+
+SeleÃ§Ã£o de 20 amostras dentro dos valores maximos (10.4) e minimos(5.2) apresentados pela variavel numero de meses com precipitaÃ§Ã£o inferior a 100mm.
+
+```{r Range de amostras de nÃºmero de meses com precipitaÃ§Ã£o inferior a 100mm}
+Range_amostras <- range(Amostras_filtradas$Inf100)
+Quantidade_de_amostras <- 20
+Range_amostras <- seq(Range_amostras[1]-0.1, Range_amostras[2], length.out = Quantidade_de_amostras)
+```
+
+### CÃ¡lculo de mÃ¡ximos locais para fronteira de eficiÃªncia do numero de meses com precipitaÃ§Ã£o inferior a 100mm.
+
+O loop for() farÃ¡ a seleÃ§Ã£o dos maiores valores da variavel numero de meses com precipitaÃ§Ã£o inferior a 100mm(Inf100) para cada intervalo de valores correspondente da altura relativa(rh100).
+
+```{r Calculo de mÃ¡ximos locais para o nÃºmero de meses com precipitaÃ§Ã£o inferior a 100mm}
+Front_eficiencia <- data.frame()
+for(b in seq(1, Quantidade_de_amostras-1, 1)){
+  tempB <- Amostras_filtradas[Amostras_filtradas$Inf100 > Range_amostras[b] & Amostras_filtradas$Inf100 <= Range_amostras[b+1],]
+  tempB
+  tempB <- arrange(tempB, rh100)
+  Front_eficiencia <- rbind(Front_eficiencia, tail(tempB, 1))
+}
+Altura_potencial <- rbind(Altura_potencial, Front_eficiencia)
+```
+
+### Plot simples dos dados calculados para o numero de meses com precipitaÃ§Ã£o inferior a 100mm.
+
+```{r Plot nÃºmero de meses com precipitaÃ§Ã£o inferior a 100mm}
+plot(Amostras_filtradas$Inf100, Amostras_filtradas$rh100, pch = 20)
+points(Front_eficiencia$Inf100, Front_eficiencia$rh100, pch = 20, col = 'red')
+```
+
+### Range de amostras para variavel de declividade.
+
+SeleÃ§Ã£o de 20 amostras dentro dos valores maximos (47.9) e minimos(0) apresentados pela variavel declividade.
+
+```{r Range de amostras de declividade}
+Range_amostras <- range(Amostras_filtradas$decliv)
+Quantidade_de_amostras <- 20
+Range_amostras <- seq(Range_amostras[1]-0.1, Range_amostras[2], length.out = Quantidade_de_amostras)
+```
+
+### CÃ¡lculo de mÃ¡ximos locais para fronteira de eficiÃªncia do numero de meses com precipitaÃ§Ã£o inferior a 100mm.
+
+O loop for() farÃ¡ a seleÃ§Ã£o dos maiores valores da variavel declividade(decliv) para cada intervalo de valores correspondente da altura relativa(rh100).
+
+```{r Calculo de mÃ¡ximos locais para a declividade}
+Front_eficiencia <- data.frame()
+for(b in seq(1, Quantidade_de_amostras-1, 1)){
+  tempB <- Amostras_filtradas[Amostras_filtradas$decliv > Range_amostras[b] & Amostras_filtradas$decliv <= Range_amostras[b+1],]
+  tempB
+  tempB <- arrange(tempB, rh100)
+  Front_eficiencia <- rbind(Front_eficiencia, tail(tempB, 1))
+}
+Altura_potencial <- rbind(Altura_potencial, Front_eficiencia)
+```
+
+### Plot simples dos dados calculados para o numero de meses com precipitaÃ§Ã£o inferior a 100mm.
+
+```{r Plot declividade}
+plot(Amostras_filtradas$decliv, Amostras_filtradas$rh100, pch = 20)
+points(Front_eficiencia$decliv, Front_eficiencia$rh100, pch = 20, col = 'red')
+```
+
+### Range de amostras para variavel de nÃºmero de dias sem cobertura de nÃºvens.
+
+SeleÃ§Ã£o de 20 amostras dentro dos valores maximos (226) e minimos(15) apresentados pela variavel numero de dias sem cobertura de nuvens.
+
+```{r Range de amostras de numero de dias sem cobertura de nuvens}
+Range_amostras <- range(Amostras_filtradas$NAnuvens)
+Quantidade_de_amostras <- 20
+Range_amostras <- seq(Range_amostras[1]-0.1, Range_amostras[2], length.out = Quantidade_de_amostras)
+```
+
+### CÃ¡lculo de mÃ¡ximos locais para fronteira de eficiÃªncia do nÃºmero de dias sem cobertura de nÃºvens.
+
+O loop for() farÃ¡ a seleÃ§Ã£o dos maiores valores da variavel nÃºmero de dias sem cobertura de nÃºvens(NAnuvens) para cada intervalo de valores correspondente da altura relativa(rh100).
+
+```{r Calculo de mÃ¡ximos locais para o numero de dias sem cobertura de nuven}
+Front_eficiencia <- data.frame()
+for(b in seq(1, Quantidade_de_amostras-1, 1)){
+  tempB <- Amostras_filtradas[Amostras_filtradas$NAnuvens > Range_amostras[b] & Amostras_filtradas$NAnuvens <= Range_amostras[b+1],]
+  tempB
+  tempB <- arrange(tempB, rh100)
+  Front_eficiencia <- rbind(Front_eficiencia, tail(tempB, 1))
+}
+Altura_potencial <- rbind(Altura_potencial, Front_eficiencia)
+```
+
+### Plot simples dos dados calculados para o numero de meses com precipitaÃ§Ã£o inferior a 100mm.
+
+```{r Plot numero de dias sem cobertura de nuven}
+plot(Amostras_filtradas$NAnuvens, Amostras_filtradas$rh100, pch = 20)
+points(Front_eficiencia$NAnuvens, Front_eficiencia$rh100, pch = 20, col = 'red')
+```
+
+## Modelagem por Machine Learning Random Forest
+
+SeleÃ§Ã£o dos inputs do modelo que apresentarem melhores correlaÃ§Ãµes com a variavel rh100 (). E seleÃ§Ã£o do output de prediÃ§Ã£o do modelo, no caso, esperamos estimar a Altura Relativa dos povoamentos florestais.
+
+```{r SeleÃ§Ã£o de inputs e output}
+input <- Altura_potencial %>%
+  select(-mapbiomas) %>%
+  select(-mde) %>%
+  select(-tempMA) %>%
+  select(-count) %>%
+  select(-rh100)
+output <- Altura_potencial %>% select(rh100)
+```
+
+### Treinamento do modelo Random Forest
+
+O modelo serÃ¡ submetido a validaÃ§Ã£o cruzada de 5K folds para melhor acurÃ¡cia. 
+
+```{r Modelo Random Forest}
+drivers <- cbind(output, input)
+
+
+folds <- drivers %>%
+  row.names() %>%
+  groupKFold(k = 5) 
+
+group_fit_control <- trainControl(index = folds, method = "cv", number = 5)
+
+
+rf.altura <- train(rh100 ~ .,                                    
+                     data = drivers,
+                     method='rf',                                     
+                     importance=T,
+                     trControl = group_fit_control)
+
+rm(folds, group_fit_control, drivers) 
+```
+
+### VisualizaÃ§Ã£o do modelo treinado
+
+Pelo comando varImp() podemos observar o grau de importÃ¢ncia de cada variavel assim como MSE e RMSE.
+
+```{r Modelo treinado}
+print(rf.altura)
+varImp(rf.altura)
+```
+
+### ImportaÃ§Ã£o de camadas
+
+Para prediÃ§Ã£o dos valores treinados pelo modelo Random Forest Ã© necessario a importaÃ§Ã£o de camadas raster que representam os valores extraidos no conjunto de dados Amostras.
+
+#### Download de dados.
+
+As camadas utilizadas podem ser obtidos a partir do link para o google drive abaixo.
+https://drive.google.com/drive/folders/1QanoZOvPIz2DayJjVKYLTdrzBkScVAOY?usp=sharing
+
+### Configurando a camada declividade como referencia
+
+Para os proximos raster apresentarem matrizes de mesma configuraÃ§Ã£o, utilizaremos a camada declividade como referencia.
+
+```{r ConfiguraÃ§Ã£o da camada de referÃªncia}
+decliv <- abs(raster('decliv.tif'))
+decliv <- setMinMax(decliv)
+ref <- abs(decliv)
+```
+
+### Configurando demais camadas
+
+```{r ConfiguraÃ§Ã£o de demais camadas}
+NAnuvens <- raster('NAnuvens.tif') %>% crop(ref)
+NAnuvens <- abs(NAnuvens)
+NAnuvens <- raster(vals=values(NAnuvens),
+                    ext=extent(ref),
+                    nrows=dim(ref)[1],
+                    ncols=dim(ref)[2])
+NAnuvens <- setMinMax(NAnuvens)
+
+
+Inf100 <- raster('Inf100.tif') %>% crop(ref)
+Inf100 <- abs(Inf100)
+Inf100 <- raster(vals=values(Inf100),
+                    ext=extent(ref),
+                    nrows=dim(ref)[1],
+                    ncols=dim(ref)[2])
+Inf100 <- setMinMax(Inf100)
+
+
+precMA <- raster('precMA.tif') %>% crop(ref)
+precMA <- abs(precMA)
+precMA <- raster(vals=values(precMA),
+                    ext=extent(ref),
+                    nrows=dim(ref)[1],
+                    ncols=dim(ref)[2])
+precMA <- setMinMax(precMA)
+
+
+```
+
+### Stack de camadas e prediÃ§Ã£o
+
+Com as camadas nas devidas dimensoes, podemos fazer o stack das mesmas para entao utilizar no modelo treinado.
+O objeto Raster_altura serÃ¡ o produto final desta anÃ¡lise.
+
+```{r Stack de layers}
+layers <- stack(decliv, NAnuvens, Inf100, precMA)
+names(layers) <- c("decliv",
+                  "NAnuvens",
+                  "Inf100",
+                  "precMA")
+
+Raster_altura <- predict(layers, rf.altura)
+```
+
+### ExportaÃ§Ã£o de camada
+
+Caso queira salvar como .tif
+
+```{r plot do resultado da camada}
+# writeRaster(Raster_altura, 'altura_potencial_M.tif')
+plot(Raster_altura)
+```
+
+
+
